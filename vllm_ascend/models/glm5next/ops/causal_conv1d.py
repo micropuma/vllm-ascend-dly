@@ -3,10 +3,12 @@
 """AscendC short convolution for GLM prefill, decode and MTP verification."""
 
 import torch
+from vllm.logger import logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 CONV_STATE_COPY_BLOCK_SIZE = 256
+_NATIVE_CALLS = 0
 
 
 @triton.jit
@@ -56,6 +58,22 @@ def causal_conv1d(
     num_accepted_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Consume GDN metadata and update the caller's [cache, state_len, dim] state."""
+    global _NATIVE_CALLS
+    _NATIVE_CALLS += 1
+    if _NATIVE_CALLS <= 4:
+        logger.info(
+            "[glm5next/causal_conv1d] native custom op call=%d run_mode=%s "
+            "x=%s state=%s qloc=%s cache_indices=%s accepted=%s "
+            "state_contiguous=%s",
+            _NATIVE_CALLS,
+            run_mode,
+            tuple(x.shape),
+            tuple(conv_state.shape),
+            tuple(query_start_loc.shape),
+            tuple(cache_indices.shape),
+            tuple(num_accepted_tokens.shape) if num_accepted_tokens is not None else None,
+            conv_state.is_contiguous(),
+        )
     # Padded requests can be skipped by the kernel; their output must stay zero.
     output = torch.zeros_like(x)
     if cache_indices.shape[0] == 0:
