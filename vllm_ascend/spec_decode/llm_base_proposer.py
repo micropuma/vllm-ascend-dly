@@ -600,7 +600,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 else:
                     self.model.lm_head = target_lm_head
 
-        if self.method == "mtp" and self.vllm_config.model_config.is_deepseek_mla:
+        # PR 15470
+        # GLM-5.3-Flash is exposed by vLLM as ``deepseek_mtp``. Matching only
+        # the historical ``mtp`` spelling silently skips this block, leaving
+        # the checkpoint's extra shared_head.head in use. The official
+        # checkpoint ties MTP logits to the target lm_head, so force that tie
+        # when the GLM-5 MTP head has the same vocabulary shape.
+        if self.method in ("mtp", "deepseek_mtp") and self.vllm_config.model_config.is_deepseek_mla:
             # Multimodal wrappers such as Glm5NextForConditionalGeneration keep
             # lm_head on the nested language model, so resolve it the same way
             # the EAGLE branch above does.
@@ -621,12 +627,43 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # unequal and would leave the draft predicting from garbage, so ask
                 # the model whether it owns a head before falling back to the
                 # comparison.
+                is_glm5_mtp = self.model.__class__.__name__ == "Glm5NextMTP"
                 draft_owns_head = getattr(self.model, "has_own_lm_head", None)
-                for _, layer_module in self.model.model.layers.items():
-                    if draft_owns_head is False or torch.equal(
-                        layer_module.shared_head.head.weight, target_lm_head.weight
-                    ):
+                replaced_layers = 0
+                total_layers = 0
+                for layer_name, layer_module in self.model.model.layers.items():
+                    total_layers += 1
+                    draft_head = getattr(getattr(layer_module, "shared_head", None), "head", None)
+                    draft_weight = getattr(draft_head, "weight", None)
+                    target_weight = getattr(target_lm_head, "weight", None)
+                    same_shape = (
+                        draft_weight is not None
+                        and target_weight is not None
+                        and draft_weight.shape == target_weight.shape
+                    )
+                    identical_head = (
+                        draft_weight is not None
+                        and target_weight is not None
+                        and torch.equal(draft_weight, target_weight)
+                    )
+                    should_share = (
+                        draft_head is not None
+                        and ((is_glm5_mtp and same_shape) or draft_owns_head is False or identical_head)
+                    )
+                    if should_share:
                         layer_module.shared_head.head = target_lm_head
+                        replaced_layers += 1
+                        
+                logger.info(
+                    "[spec_decode/base] GLM MTP lm_head summary: method=%s "
+                    "is_deepseek_mla=%s model=%s target=%s replaced=%d/%d",
+                    self.method,
+                    self.vllm_config.model_config.is_deepseek_mla,
+                    type(self.model).__name__,
+                    type(target_lm_head).__name__,
+                    replaced_layers,
+                    total_layers,
+                )
 
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
             logger.info(
