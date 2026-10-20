@@ -110,7 +110,9 @@ class TestTorchNPUProfilerWrapper(TestBase):
         profile_kwargs = mock_profile.call_args.kwargs
         self.assertEqual(profile_kwargs["activities"], ["CPU", "NPU"])
         self.assertTrue(profile_kwargs["profile_memory"])
-        self.assertEqual(profile_kwargs["with_modules"], True)
+        self.assertTrue(profile_kwargs["with_stack"])
+        self.assertFalse(profile_kwargs["with_modules"])
+        self.assertIn("schedule", profile_kwargs)
         self.assertEqual(profile_kwargs["on_trace_ready"], mock_trace_handler_instance)
         self.assertEqual(result, mock_profiler_instance)
 
@@ -226,6 +228,7 @@ class TestTorchNPUProfilerWrapper(TestBase):
             wrapper = TorchNPUProfilerWrapper(profiler_config, "trace_name")
 
         self.assertTrue(wrapper._profiler_step())
+        wrapper.profiler.step.assert_called_once()
 
     def test_step_calls_underlying_start_after_delay_iterations(self):
         """Work matches vLLM WorkerProfiler: first N worker steps defer _start."""
