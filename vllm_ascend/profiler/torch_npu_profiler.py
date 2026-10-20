@@ -19,6 +19,7 @@
 from contextlib import suppress
 from typing import Any
 
+import torch
 import torch_npu
 from vllm.config import ProfilerConfig
 from vllm.profiler.wrapper import WorkerProfiler
@@ -54,7 +55,7 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
             aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
             l2_cache=False,
             op_attr=False,
-            data_simplification=True,
+            data_simplification=False,
             record_op_args=False,
             gc_detect_threshold=None,
         )
@@ -64,10 +65,12 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
                 torch_npu.profiler.ProfilerActivity.CPU,
                 torch_npu.profiler.ProfilerActivity.NPU,
             ],
-            with_stack=False,
+            record_shapes=profiler_config.torch_profiler_record_shapes,
+            with_stack=profiler_config.torch_profiler_with_stack,
             profile_memory=profiler_config.torch_profiler_with_memory,
-            # NOTE: torch_npu.profiler.with_modules is equivalent to torch.profiler.with_stack.
-            # The with_stack option in torch_npu.profiler introduces significant time overhead.
+            # Keep module hierarchy together with Python stacks. MindStudio needs
+            # the in-process torch_npu trace; an external sampler cannot be
+            # correlated reliably with NPU events.
             with_modules=profiler_config.torch_profiler_with_stack,
             experimental_config=experimental_config,
             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
@@ -84,3 +87,6 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
 
     def _profiler_step(self) -> bool:
         return True
+
+    def annotate_context_manager(self, name: str):
+        return torch.profiler.record_function(name)
