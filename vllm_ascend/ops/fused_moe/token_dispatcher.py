@@ -582,13 +582,15 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         hidden_states = hidden_states.view(-1, hidden_states.size(-1))
         (
             tokens_per_expert,
-            input_splits,
-            output_splits,
-            global_input_tokens_local_experts_indices,
+            input_splits_cpu,
+            output_splits_cpu,
+            num_global_tokens_per_local_expert,
+            splits_copy_done,
             num_out_tokens,
         ) = self._preprocess(topk_ids)
         hidden_shape_before_permute = hidden_states.shape
 
+        # Enqueue independent device work before waiting for the split copies.
         permutated_local_input_tokens, reversed_local_input_permutation_mapping = torch_npu.npu_moe_token_permute(
             tokens=hidden_states,
             indices=topk_ids,
@@ -600,6 +602,24 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
                 self.lora_context,
                 topk_ids=topk_ids,
                 reversed_permutation_mapping=reversed_local_input_permutation_mapping,
+            )
+
+        # The event covers the D2H copies, not the permutation queued after it.
+        # Host split values must not be read before this wait completes.
+        splits_copy_done.synchronize()
+        input_splits = input_splits_cpu.numpy()
+        output_splits = output_splits_cpu.numpy()
+        num_recv_tokens = int(output_splits.sum())
+
+        global_input_tokens_local_experts_indices = None
+        if self.num_local_experts > 1:
+            # 收到的每一行，各归哪个本地专家
+            # A host output_size avoids repeat_interleave's implicit device
+            # synchronization to determine the sum of its device-side repeats.
+            global_input_tokens_local_experts_indices = torch.repeat_interleave(
+                self.expert_ids_per_ep_rank,
+                num_global_tokens_per_local_expert.ravel(),
+                output_size=num_recv_tokens,
             )
 
         return (
@@ -614,47 +634,47 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         )
 
     def _preprocess(self, topk_ids: torch.Tensor):
+        """Queue dispatch metadata and D2H copies without reading host splits.
+
+        The caller must synchronize the returned event before accessing the
+        CPU tensors. Independent device work can be queued before that wait.
+        """
+        # 输出每卡每个专家有几个
         num_local_tokens_per_expert = torch.histc(topk_ids, bins=self.num_experts, min=0, max=self.num_experts)
 
         ep_size = self.ep_size
         num_out_tokens = topk_ids.numel()
 
-        input_splits = (
-            num_local_tokens_per_expert.reshape(ep_size, self.num_local_experts)
-            .sum(axis=1)
-            .to(torch.device("cpu"), non_blocking=True)
-            .numpy()
-        )
+        # 算出本 rank 需要发多少
+        input_splits_dev = num_local_tokens_per_expert.reshape(ep_size, self.num_local_experts).sum(axis=1)
 
+        # 和其他 rank 交换计数
         num_global_tokens_per_expert = gather_from_sequence_parallel_region(
             num_local_tokens_per_expert, group=self.ep_group
         ).reshape(ep_size, self.num_experts)
+
+        # 列出本rank关心的列
         num_global_tokens_per_local_expert = num_global_tokens_per_expert[
             :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
         ]
-        if num_global_tokens_per_local_expert is None:
-            raise ValueError("num_global_tokens_per_local_expert must be set before sum.")
-
-        output_splits = (
-            num_global_tokens_per_local_expert.sum(axis=-1).to(torch.device("cpu"), non_blocking=True).numpy()
-        )
+        # 生成接收表
+        output_splits_dev = num_global_tokens_per_local_expert.sum(axis=-1)
+        # 本地专家计数
         num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(axis=0)
 
-        global_input_tokens_local_experts_indices = None
-        if self.num_local_experts > 1:
-            if num_global_tokens_per_local_expert is None:
-                raise ValueError("num_global_tokens_per_local_expert must be set before operations.")
-            global_input_tokens_local_experts_indices = torch.repeat_interleave(
-                self.expert_ids_per_ep_rank, num_global_tokens_per_local_expert.ravel()
-            )
-        else:
-            torch.npu.synchronize()
+        # Both copies are ordered on the current stream and guarded by one
+        # event. Keep the CPU tensors alive until the caller consumes them.
+        input_splits_cpu = input_splits_dev.to(torch.device("cpu"), non_blocking=True)
+        output_splits_cpu = output_splits_dev.to(torch.device("cpu"), non_blocking=True)
+        splits_copy_done = torch.npu.Event()
+        splits_copy_done.record()
 
         return (
             num_tokens_per_local_expert,
-            input_splits,
-            output_splits,
-            global_input_tokens_local_experts_indices,
+            input_splits_cpu,
+            output_splits_cpu,
+            num_global_tokens_per_local_expert,
+            splits_copy_done,
             num_out_tokens,
         )
 
