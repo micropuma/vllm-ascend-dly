@@ -72,6 +72,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Select the GLM-5.3-Flash KPool indexer backend. Valid values are "auto"
+    # (default, use the CANN key_pool/pool_key_indexer operators when the
+    # external cann_ops_transformer package provides them, otherwise fall back
+    # to the equivalent triton kernels), "cann" (require the CANN operators and
+    # fail loudly when they are missing), and "triton" (always use the triton
+    # kernels). Not sensitive.
+    "VLLM_ASCEND_GLM_KPOOL_BACKEND": lambda: os.getenv("VLLM_ASCEND_GLM_KPOOL_BACKEND", "auto"),
 }
 
 # end-env-vars-definition

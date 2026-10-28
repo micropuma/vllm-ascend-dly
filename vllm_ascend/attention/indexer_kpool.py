@@ -14,6 +14,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_pcp_group, get_tp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -23,6 +24,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
+from vllm_ascend import envs
 from vllm_ascend.attention.context_parallel.sfa_dcp_utils import get_sfa_pcp_global_metadata
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.core.kv_cache_interface import (
@@ -598,10 +600,21 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         self.k_cache: Any = vllm_indexer.k_cache
         self.tail_cache: Any = vllm_indexer.tail_cache
         self.topk_indices_buffer: torch.Tensor | None = vllm_indexer.topk_indices_buffer
-        self._init_cann_ops()
+        self._init_triton_adapters()
+        self._use_cann_key_pool = self._init_cann_ops()
+        if not self._use_cann_key_pool:
+            # The triton orchestrator performs the same compression and writes
+            # the same caches. It reads the tail page through a strided
+            # [blocks, 2, capacity, head_dim] view, so the CANN layout
+            # [blocks, capacity, 2 * head_dim] is reused in place.
+            from vllm_ascend.models.glm5next.sparse_attn_indexer_kpool import SparseAttnIndexerKpool
+
+            self.indexer_op = SparseAttnIndexerKpool(self.topk_tokens, self.head_dim)
         for name in (
             "_key_weight",
             "_gate_weight",
+            "_key_weight_f32",
+            "_gate_weight_f32",
             "_head_weight_f32",
             "_norm_weight_f32",
             "_norm_bias_f32",
@@ -625,6 +638,10 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         self._key_weight = self.wk_weights_proj.weight[: self.head_dim].detach().contiguous()
         self._gate_weight = self.index_kpool_compress_gate.detach().to(self._key_weight.dtype).contiguous()
         self._head_weight_f32 = self.wk_weights_proj.weight[self.head_dim :].detach().float().contiguous()
+        # The triton path projects keys and gates in FP32, matching the
+        # compressor tail dtype. The CANN path keeps the checkpoint dtype.
+        self._key_weight_f32 = self.wk_weights_proj.weight[: self.head_dim].detach().float().contiguous()
+        self._gate_weight_f32 = self.index_kpool_compress_gate.detach().float().contiguous()
         self._norm_weight_f32 = self.k_norm.weight.detach().float() if self.k_norm.weight is not None else None
         self._norm_bias_f32 = self.k_norm.bias.detach().float() if self.k_norm.bias is not None else None
 
@@ -693,7 +710,8 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
                 k_hidden = F.pad(k_hidden, (0, 0, 0, padding))
             gathered_hidden = get_pcp_group().all_gather(k_hidden.contiguous(), dim=0)
             k_hidden = torch.index_select(gathered_hidden, 0, restore_indices)
-        return self._forward_cann(
+        forward_impl = self._forward_cann if self._use_cann_key_pool else self._forward_triton
+        return forward_impl(
             k_hidden,
             q_values,
             weights,
@@ -704,25 +722,61 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             compute_topk=compute_topk,
         )
 
-    def _init_cann_ops(self) -> None:
+    def _init_triton_adapters(self) -> None:
         try:
-            import_module("cann_ops_transformer")
             adapters = import_module("vllm_ascend.ops.cann_keypool")
             fused = import_module("vllm_ascend.ops.triton.glm5_next_cann_keypool")
             self._gather_retained_hidden = adapters.gather_retained_hidden
             self._pack_keypool_indices = fused.pack_keypool_indices
             self._prepare_keypool_state = adapters.prepare_keypool_state
             self._write_keypool_caches = fused.write_keypool_caches
-            self._key_pool = torch.ops.cann_ops_transformer.key_pool
-            self._pool_key_indexer = partial(
-                adapters.pool_key_indexer_nonempty,
-                torch.ops.cann_ops_transformer.pool_key_indexer,
-            )
         except (ImportError, AttributeError) as exc:
             raise RuntimeError(
-                "GLM-5.3-Flash KPool requires cann_ops_transformer with key_pool and pool_key_indexer, "
-                "the matching CANN ops-transformer operator package and Triton cache/index adapters."
+                "GLM-5.3-Flash KPool requires the Triton cache/index adapters exported by "
+                "vllm_ascend.ops.cann_keypool and vllm_ascend.ops.triton.glm5_next_cann_keypool."
             ) from exc
+
+    def _init_cann_ops(self) -> bool:
+        """Bind the CANN KeyPool operators when the ops package is present.
+
+        ``cann_ops_transformer`` ships separately from the CANN toolkit, so a
+        node can have a supported toolkit and still lack ``key_pool`` and
+        ``pool_key_indexer``. Returning False selects the triton backend
+        instead of failing construction, which keeps GLM-5.3-Flash deployable
+        on those nodes.
+        """
+        backend = str(envs.VLLM_ASCEND_GLM_KPOOL_BACKEND or "auto").strip().lower()
+        if backend not in ("auto", "cann", "triton"):
+            raise ValueError(f"VLLM_ASCEND_GLM_KPOOL_BACKEND must be one of auto, cann, triton; got {backend!r}.")
+        if backend == "triton":
+            logger.info("GLM KPool indexer: using the triton backend (VLLM_ASCEND_GLM_KPOOL_BACKEND=triton).")
+            return False
+        reason = ""
+        try:
+            import_module("cann_ops_transformer")
+            namespace = torch.ops.cann_ops_transformer
+            key_pool = namespace.key_pool
+            pool_key_indexer = namespace.pool_key_indexer
+            adapter = import_module("vllm_ascend.ops.cann_keypool").pool_key_indexer_nonempty
+        except (ImportError, AttributeError) as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+        else:
+            self._key_pool = key_pool
+            self._pool_key_indexer = partial(adapter, pool_key_indexer)
+            return True
+        if backend == "cann":
+            raise RuntimeError(
+                "VLLM_ASCEND_GLM_KPOOL_BACKEND=cann but cann_ops_transformer with key_pool and "
+                f"pool_key_indexer is unavailable ({reason}). Install the matching CANN "
+                "ops-transformer operator package, or unset the variable to use the triton backend."
+            )
+        logger.warning(
+            "GLM KPool indexer: cann_ops_transformer with key_pool and pool_key_indexer is unavailable "
+            "(%s); falling back to the triton backend. Set VLLM_ASCEND_GLM_KPOOL_BACKEND=cann to make "
+            "this a hard error instead.",
+            reason,
+        )
+        return False
 
     def _forward_cann(
         self,
@@ -855,3 +909,107 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         return self._pack_keypool_indices(
             indices, query_metadata, self.topk_tokens, self.index_kpool, self.topk_indices_buffer
         )
+
+    def _forward_triton(
+        self,
+        hidden_states: torch.Tensor,
+        q_values: torch.Tensor | None,
+        weights: torch.Tensor | None,
+        indexer_cache: torch.Tensor,
+        tail_cache: torch.Tensor,
+        indexer_metadata: AscendIndexerKPoolMetadata,
+        tail_metadata: AscendIndexerKPoolTailMetadata,
+        *,
+        compute_topk: bool,
+    ) -> torch.Tensor | None:
+        """Compress and select with the triton KPool operators.
+
+        This is the backend used when ``cann_ops_transformer`` is unavailable.
+        It writes the same two caches as ``_forward_cann`` and reaches the same
+        SFA top-k layout, so the two paths are interchangeable at the attention
+        boundary; only the compression and selection operators differ.
+        """
+        context = get_forward_context()
+        query_metadata = indexer_metadata.query_metadata
+        cache_metadata = indexer_metadata.write_metadata or indexer_metadata
+        output_width = self.topk_tokens + self.index_kpool - 1
+        num_query_tokens = 0 if q_values is None else q_values.shape[0]
+        if self.index_kpool <= 0 or self.topk_tokens <= 0 or self.topk_tokens % self.index_kpool:
+            raise ValueError("KPool top-k must be divisible by its positive pool size.")
+        if cache_metadata.cum_query_lens is None or cache_metadata.raw_seq_lens is None:
+            raise ValueError("GLM KPool metadata requires cum_query_lens and raw_seq_lens.")
+        if compute_topk and (q_values is None or weights is None):
+            raise ValueError("GLM KPool top-k requires query and head weights.")
+        if compute_topk and self.topk_indices_buffer is not None:
+            if (
+                self.topk_indices_buffer.ndim != 2
+                or self.topk_indices_buffer.dtype != torch.int32
+                or self.topk_indices_buffer.device != hidden_states.device
+                or self.topk_indices_buffer.stride(1) != 1
+                or (num_query_tokens > 1 and self.topk_indices_buffer.stride(0) < self.topk_indices_buffer.shape[1])
+            ):
+                raise ValueError("GLM KPool output buffer requires int32 contiguous columns on the query device.")
+            if self.topk_indices_buffer.shape[0] < num_query_tokens:
+                raise ValueError("GLM KPool output buffer must cover the token rows.")
+            if self.topk_indices_buffer.shape[1] < output_width:
+                raise ValueError("GLM KPool output buffer must cover the top-k width.")
+        if tail_cache.ndim != 3 or tail_cache.shape[2] != 2 * self.head_dim or tail_cache.stride(2) != 1:
+            raise ValueError("GLM KPool tail requires [blocks, capacity, 2 * head_dim] K/gate storage.")
+        # The triton compressor takes the tail page as [blocks, 2, capacity,
+        # head_dim] and addresses it through explicit strides, so the CANN
+        # layout is reinterpreted in place rather than reallocated.
+        tail_view = tail_cache.unflatten(-1, (2, self.head_dim)).transpose(1, 2)
+        norm_eps = getattr(self.k_norm, "eps", getattr(self.k_norm, "variance_epsilon", 1e-6))
+        assert self._key_weight_f32 is not None and self._gate_weight_f32 is not None
+        key_hidden = hidden_states.float()
+        k = F.layer_norm(
+            F.linear(key_hidden, self._key_weight_f32),
+            (self.head_dim,),
+            self._norm_weight_f32,
+            self._norm_bias_f32,
+            norm_eps,
+        )
+        gate_score = F.linear(key_hidden, self._gate_weight_f32)
+        if context.cudagraph_runtime_mode == CUDAGraphMode.FULL or indexer_metadata.seq_lens_cpu is None:
+            max_pool_seq_len = indexer_metadata.block_table.shape[1] * indexer_cache.shape[1]
+        elif indexer_metadata.seq_lens_cpu.numel():
+            max_pool_seq_len = int(indexer_metadata.seq_lens_cpu.max())
+        else:
+            max_pool_seq_len = 0
+        write_tail_slot_mapping = (
+            tail_metadata.slot_mapping
+            if tail_metadata.write_slot_mapping is None
+            else tail_metadata.write_slot_mapping
+        )
+        write_tail_block_table = (
+            tail_metadata.block_table if tail_metadata.write_block_table is None else tail_metadata.write_block_table
+        )
+        result = self.indexer_op(
+            k,
+            q_values,
+            weights,
+            indexer_metadata.positions[:num_query_tokens],
+            indexer_cache,
+            tail_view,
+            indexer_metadata,
+            tail_metadata,
+            gate_score=gate_score,
+            compress_ape=self.index_kpool_compress_ape,
+            index_kpool=self.index_kpool,
+            max_pool_seq_len=max_pool_seq_len,
+            compute_topk=compute_topk,
+            allow_cache_packing=context.cudagraph_runtime_mode != CUDAGraphMode.FULL,
+            query_metadata=query_metadata,
+            write_positions=cache_metadata.positions[: hidden_states.shape[0]],
+            write_cum_query_lens=cache_metadata.cum_query_lens,
+            write_raw_seq_lens=cache_metadata.raw_seq_lens,
+            write_indexer_slot_mapping=cache_metadata.slot_mapping,
+            write_tail_slot_mapping=write_tail_slot_mapping,
+            write_tail_block_table=write_tail_block_table,
+        )
+        if result is None or self.topk_indices_buffer is None:
+            return result
+        output = self.topk_indices_buffer[:result.shape[0]]
+        output.fill_(-1)
+        output[:, : result.shape[-1]].copy_(result[:, 0])
+        return result

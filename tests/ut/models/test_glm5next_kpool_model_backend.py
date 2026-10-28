@@ -289,6 +289,7 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
     backend.softmax_scale = 0.5
     backend._key_weight = None
     recorder = _RecordingKPool()
+    backend._use_cann_key_pool = True
     backend._forward_cann = recorder.forward
     tail_metadata = _tail_metadata()
     monkeypatch.setattr(
@@ -392,8 +393,8 @@ def test_dsacp_kpool_compresses_global_tokens_and_selects_local_queries(monkeypa
     torch.testing.assert_close(result[:3, 0, 0], torch.tensor([0, 0, 0], dtype=torch.int32))
 
 
-@pytest.mark.parametrize("missing", ["cann_ops_transformer", "vllm_ascend.ops.triton.glm5_next_cann_keypool"])
-def test_cann_backend_reports_missing_operator_dependencies(monkeypatch, missing):
+@pytest.mark.parametrize("missing", ["vllm_ascend.ops.cann_keypool", "vllm_ascend.ops.triton.glm5_next_cann_keypool"])
+def test_triton_adapters_report_missing_dependencies(monkeypatch, missing):
     def load(name):
         if name == missing:
             raise ImportError(name)
@@ -401,9 +402,132 @@ def test_cann_backend_reports_missing_operator_dependencies(monkeypatch, missing
 
     loader = MagicMock(side_effect=load)
     monkeypatch.setattr(backend_module, "import_module", loader)
-    with pytest.raises(RuntimeError, match="CANN ops-transformer operator package and Triton cache/index adapters"):
-        Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)._init_cann_ops()
+    with pytest.raises(RuntimeError, match="Triton cache/index adapters"):
+        Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)._init_triton_adapters()
     assert missing in [call.args[0] for call in loader.call_args_list]
+
+
+def test_cann_ops_absent_falls_back_to_triton(monkeypatch):
+    def load(name):
+        if name == "cann_ops_transformer":
+            raise ImportError(name)
+        return MagicMock()
+
+    monkeypatch.setattr(backend_module, "import_module", load)
+    monkeypatch.setattr(backend_module.envs, "VLLM_ASCEND_GLM_KPOOL_BACKEND", "auto")
+    op = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
+    assert op._init_cann_ops() is False
+    assert not hasattr(op, "_key_pool")
+
+
+def test_cann_backend_still_binds_operators_when_available(monkeypatch):
+    monkeypatch.setattr(backend_module, "import_module", MagicMock())
+    monkeypatch.setattr(backend_module.envs, "VLLM_ASCEND_GLM_KPOOL_BACKEND", "auto")
+    key_pool, pool_key_indexer = MagicMock(), MagicMock()
+    fake_ops = SimpleNamespace(key_pool=key_pool, pool_key_indexer=pool_key_indexer)
+    monkeypatch.setattr(
+        backend_module, "torch", SimpleNamespace(ops=SimpleNamespace(cann_ops_transformer=fake_ops))
+    )
+    op = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
+    assert op._init_cann_ops() is True
+    assert op._key_pool is key_pool
+    assert op._pool_key_indexer.args[0] is pool_key_indexer
+
+
+def test_cann_backend_env_override_is_honored(monkeypatch):
+    loader = MagicMock()
+    monkeypatch.setattr(backend_module, "import_module", loader)
+    monkeypatch.setattr(backend_module.envs, "VLLM_ASCEND_GLM_KPOOL_BACKEND", "triton")
+    op = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
+    assert op._init_cann_ops() is False
+    loader.assert_not_called()
+
+    monkeypatch.setattr(backend_module.envs, "VLLM_ASCEND_GLM_KPOOL_BACKEND", "cann")
+    loader.side_effect = ImportError("cann_ops_transformer")
+    with pytest.raises(RuntimeError, match="VLLM_ASCEND_GLM_KPOOL_BACKEND=cann"):
+        op._init_cann_ops()
+
+
+def test_cann_backend_rejects_unknown_override(monkeypatch):
+    monkeypatch.setattr(backend_module.envs, "VLLM_ASCEND_GLM_KPOOL_BACKEND", "nonsense")
+    op = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
+    with pytest.raises(ValueError, match="must be one of auto, cann, triton"):
+        op._init_cann_ops()
+
+
+@pytest.mark.parametrize("pcp", [False, True])
+def test_triton_fallback_reuses_the_cann_tail_layout(monkeypatch, pcp) -> None:
+    compress = MagicMock()
+    select = MagicMock(return_value=torch.full((8, 1, 7), 5, dtype=torch.int32))
+    monkeypatch.setattr(kpool_module, "glm5_next_kpool_tail_compress_and_write_cache_triton", compress)
+    monkeypatch.setattr(kpool_module, "glm5_next_lightning_indexer_triton", select)
+    monkeypatch.setattr(
+        backend_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.NONE),
+    )
+    op = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
+    nn.Module.__init__(op)
+    op.topk_tokens, op.head_dim, op.index_kpool = 4, 2, 4
+    op.k_norm = SimpleNamespace(eps=1e-6)
+    op._norm_weight_f32 = op._norm_bias_f32 = None
+    op._key_weight_f32 = torch.ones(2, 3)
+    op._gate_weight_f32 = torch.ones(2, 3)
+    op.index_kpool_compress_ape = torch.zeros(4, 2)
+    op.indexer_op = SparseAttnIndexerKpool(4, 2)
+    output_buffer = torch.empty(8, 7, dtype=torch.int32)
+    op.topk_indices_buffer = output_buffer
+    indexer_cache = torch.zeros(2, 2, 1, 2, dtype=torch.bfloat16)
+    # The CANN layout stores K and gate interleaved on the page's last axis.
+    tail_cache = torch.zeros(2, 4, 4)
+    metadata = _indexer_metadata()
+    tail_metadata = _tail_metadata()
+    if pcp:
+        metadata.write_metadata = replace(
+            metadata,
+            positions=torch.arange(8, dtype=torch.int64),
+            cum_query_lens=torch.tensor([8], dtype=torch.int32),
+            raw_seq_lens=torch.tensor([8], dtype=torch.int32),
+            slot_mapping=torch.arange(8, dtype=torch.int64),
+        )
+        tail_metadata.write_slot_mapping = torch.arange(8, dtype=torch.int64) + 100
+        tail_metadata.write_block_table = torch.tensor([[3]], dtype=torch.int32)
+    cache_metadata = metadata.write_metadata if pcp else metadata
+    write_tail_slots = tail_metadata.write_slot_mapping if pcp else tail_metadata.slot_mapping
+    write_tail_table = tail_metadata.write_block_table if pcp else tail_metadata.block_table
+
+    result = op._forward_triton(
+        torch.ones(8, 3),
+        torch.zeros(8, 1, 2, dtype=torch.bfloat16),
+        torch.ones(8, 1, dtype=torch.bfloat16),
+        indexer_cache,
+        tail_cache,
+        metadata,
+        tail_metadata,
+        compute_topk=True,
+    )
+
+    # Compression writes through the permuted view of the CANN page.
+    state = compress.call_args.args[0]
+    assert state.shape == (2, 2, 4, 2)
+    assert state.stride() == (16, 2, 4, 1)
+    assert state.data_ptr() == tail_cache.data_ptr()
+    assert compress.call_args.args[2].shape == (8, 2)
+    assert compress.call_args.args[2].dtype == torch.float32
+    torch.testing.assert_close(compress.call_args.args[5], cache_metadata.positions[:8])
+    torch.testing.assert_close(compress.call_args.args[6], cache_metadata.cum_query_lens)
+    torch.testing.assert_close(compress.call_args.args[7], cache_metadata.raw_seq_lens)
+    torch.testing.assert_close(compress.call_args.args[8], write_tail_slots)
+    assert compress.call_args.args[9] is write_tail_table
+    torch.testing.assert_close(compress.call_args.args[10], cache_metadata.slot_mapping)
+    # Selection keeps the local request boundaries and query positions.
+    assert select.call_args.args[3] is metadata.cum_query_lens
+    torch.testing.assert_close(select.call_args.args[6], metadata.positions)
+    assert select.call_args.kwargs["pack_tail"] is True
+    assert select.call_args.kwargs["output_buffer"] is None
+    # The shared top-k buffer keeps the selection for skip_topk layers.
+    assert result is select.return_value
+    assert (output_buffer == 5).all()
 
 
 @pytest.mark.parametrize("compute_topk", [False, True])
@@ -555,6 +679,7 @@ def test_backend_restores_pcp_keys_before_kpool_cache_write(monkeypatch, pcp_loc
     backend.softmax_scale = 0.5
     backend._key_weight = None
     recorder = _RecordingKPool()
+    backend._use_cann_key_pool = True
     backend._forward_cann = recorder.forward
     tail_metadata = _tail_metadata()
     metadata = _indexer_metadata(num_tokens=2)
