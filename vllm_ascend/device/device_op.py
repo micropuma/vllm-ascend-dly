@@ -23,6 +23,7 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.triton_utils import HAS_TRITON
 
+from vllm_ascend.models.glm5next.indexer_contract import sparse_index_block_size
 from vllm_ascend.device import utils as device_utils
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, get_current_hardware_profile
 from vllm_ascend.ops.triton.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd_kernel
@@ -455,7 +456,7 @@ class BaseDeviceAdaptor:
                 value=kv,
                 sparse_indices=topk_indices,
                 scale_value=sfa_impl.scale,
-                sparse_block_size=1,
+                sparse_block_size=sparse_index_block_size(topk_indices, kv.shape[1]),
                 block_table=block_table,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_kv=actual_seq_lengths_key,
@@ -497,7 +498,7 @@ class BaseDeviceAdaptor:
             value=kv,
             sparse_indices=topk_indices,
             scale_value=sfa_impl.scale,
-            sparse_block_size=1,
+            sparse_block_size=sparse_index_block_size(topk_indices, kv.shape[1]),
             block_table=block_table,
             actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_kv=actual_seq_lengths_key,
@@ -856,7 +857,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             value=kv,
             sparse_indices=topk_indices,
             scale_value=sfa_impl.scale,
-            sparse_block_size=1,
+            sparse_block_size=sparse_index_block_size(topk_indices, kv.shape[1]),
             block_table=block_table,
             actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_kv=actual_seq_lengths_key,

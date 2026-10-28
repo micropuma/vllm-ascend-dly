@@ -59,7 +59,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
-from vllm.v1.utils import report_usage_stats
+from vllm.v1.utils import compute_iteration_details, report_usage_stats
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
@@ -791,10 +791,21 @@ class NPUWorker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
+        profile_scope = nullcontext()
         if self.profiler is not None:
             self.profiler.step()
+            if self.profiler.is_running:
+                details = compute_iteration_details(scheduler_output)
+                annotation = (
+                    f"execute_context_{details.num_ctx_requests}"
+                    f"({details.num_ctx_tokens})_generation_"
+                    f"{details.num_generation_requests}"
+                    f"({details.num_generation_tokens})"
+                )
+                profile_scope = self.profiler.annotate_context_manager(annotation)
 
-        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        with profile_scope:
+            output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 

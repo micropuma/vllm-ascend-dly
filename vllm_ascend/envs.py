@@ -79,6 +79,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Use the single-kernel GLM-5.3-Flash indexer KPool slot mapping path.
+    "VLLM_ASCEND_ENABLE_KPOOL_SLOT_TRITON": lambda: _strict_binary_env("VLLM_ASCEND_ENABLE_KPOOL_SLOT_TRITON"),
+    # Initialize GLM-5.3-Flash indexer scores in-kernel and avoid nan_to_num.
+    "VLLM_ASCEND_ENABLE_INDEXER_INF_FILL": lambda: _strict_binary_env("VLLM_ASCEND_ENABLE_INDEXER_INF_FILL"),
+    # GLM indexer fusion gates. Non-sensitive, default 0; valid values 0/1.
+    "VLLM_ASCEND_ENABLE_TRITON_INDEXER_QBAR": lambda: _strict_binary_env("VLLM_ASCEND_ENABLE_TRITON_INDEXER_QBAR"),
+    "VLLM_ASCEND_ENABLE_TRITON_INDEXER_EPILOGUE": lambda: _strict_binary_env("VLLM_ASCEND_ENABLE_TRITON_INDEXER_EPILOGUE"),
+    "VLLM_ASCEND_ENABLE_INDEXER_POOL_ID": lambda: _strict_binary_env("VLLM_ASCEND_ENABLE_INDEXER_POOL_ID"),
+    "VLLM_ASCEND_ENABLE_INDEXER_GEMM_SCORE": lambda: _strict_binary_env("VLLM_ASCEND_ENABLE_INDEXER_GEMM_SCORE"),
+    # GLM spec output direct write. Non-sensitive, default 0; valid 0/1.
+    "VLLM_ASCEND_ENABLE_SPEC_MERGE_DIRECT_WRITE": lambda: _strict_binary_env("VLLM_ASCEND_ENABLE_SPEC_MERGE_DIRECT_WRITE"),
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),

@@ -4,6 +4,8 @@ import typing
 from collections.abc import Callable, Iterable
 
 import torch
+
+from vllm_ascend.models.glm5next.indexer_contract import indexer_pool_id_enabled
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.fused_moe import (
@@ -24,6 +26,7 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+
 from .model import (
     Glm5NextDecoderLayer,
     Glm5NextMLAAttention,
@@ -35,6 +38,9 @@ from .model import (
 from .ops.fused_eh_norm import fused_eh_norm
 
 
+MTP_ROT_WEIGHT_NAME = "rot.weight"
+
+
 class Glm5NextMultiTokenPredictorLayer(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
         super().__init__()
@@ -42,10 +48,16 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
         quant_config = vllm_config.quant_config
+        quant_description = getattr(quant_config, "quant_description", None)
+        self.is_rot_used = bool(
+            quant_description and quant_description.get("is_rot_used", False)
+        )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        if self.is_rot_used:
+            self.rot = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
 
         # Reserve room for the incomplete pool tail and align the sparse MLA
         # buffer width to BLOCK_N=128.
@@ -53,7 +65,7 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         assert topk_tokens is not None
         kpool = config.index_kpool
         assert kpool is not None
-        buffer_width = topk_tokens + (kpool - 1 if kpool > 1 else 0)
+        buffer_width = (topk_tokens // kpool + 1 if indexer_pool_id_enabled(kpool) else topk_tokens + (kpool - 1 if kpool > 1 else 0))
         sparse_topk_block_n = 128
         buffer_width = ((buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n) * sparse_topk_block_n
         topk_indices_buffer = torch.empty(
@@ -85,6 +97,8 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
+        if self.is_rot_used:
+            previous_hidden_states = self.rot(previous_hidden_states)
         # Fused: zero pos-0 embeds + enorm(embeds) + hnorm(prev) + cat -> [N, 2H].
         eh_input = fused_eh_norm(
             positions,
@@ -249,6 +263,8 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         return self.model.get_top_tokens(hidden_states, spec_step_idx)
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
+        if name == MTP_ROT_WEIGHT_NAME:
+            return f"model.layers.{spec_layer}.rot.weight"
         spec_layer_weight_names = [
             "embed_tokens",
             "enorm",
@@ -317,7 +333,10 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
-            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+            if name == MTP_ROT_WEIGHT_NAME:
+                spec_layer = self.model.mtp_start_layer_idx
+            else:
+                spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
             name = self._rewrite_spec_layer_name(spec_layer, name)
@@ -409,5 +428,11 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         ):
             if layer_idx not in loaded_layers:
                 raise ValueError(f"MTP speculative decoding layer {layer_idx} weights missing from checkpoint.")
+        if any(layer.is_rot_used for layer in self.model.layers.values()):
+            rot_name = f"model.layers.{self.model.mtp_start_layer_idx}.rot.weight"
+            if rot_name not in loaded_params:
+                raise ValueError(
+                    "GLM5-Next MTP requires rot.weight when the quantization config sets is_rot_used."
+                )
         self._maybe_set_own_lm_head(loaded_params)
         return loaded_params

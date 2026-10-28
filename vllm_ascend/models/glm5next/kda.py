@@ -27,6 +27,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
+from vllm_ascend import envs
 from vllm_ascend.models.glm5next.config import Glm5NextConfig
 from vllm_ascend.models.glm5next.ops.causal_conv1d import causal_conv1d
 from vllm_ascend.models.glm5next.ops.kda import KDA_MAX_RECURRENT_TOKENS, chunk_kda, recurrent_kda
@@ -461,7 +462,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         def rearrange(x):
             return x.reshape(1, -1, self.local_num_heads, self.head_dim)
 
-        core_attn_out.zero_()
+        if envs.VLLM_ASCEND_ENABLE_SPEC_MERGE_DIRECT_WRITE:
+            # Actual rows are partitioned by spec/non-spec metadata and fully
+            # overwritten below. Only graph padding requires initialization.
+            core_attn_out[0, num_actual_tokens:].zero_()
+        else:
+            core_attn_out.zero_()
         if use_spec:
             spec_output = recurrent_kda(
                 rearrange(q_spec),
@@ -477,7 +483,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 lower_bound,
                 num_accepted_tokens,
             )
-            core_attn_out[0].index_copy_(0, spec_token_indx, spec_output[0])
+            if (envs.VLLM_ASCEND_ENABLE_SPEC_MERGE_DIRECT_WRITE
+                    and (non_spec_token_indx is None or non_spec_token_indx.numel() == 0)):
+                core_attn_out[0, :spec_output.shape[1]].copy_(spec_output[0])
+            else:
+                core_attn_out[0].index_copy_(0, spec_token_indx, spec_output[0])
 
         if q_ns is None:
             return

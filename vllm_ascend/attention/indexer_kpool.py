@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+from vllm_ascend.models.glm5next.indexer_contract import indexer_pool_id_enabled
 import torch.nn.functional as F
 from torch import nn
 from vllm.config import VllmConfig
@@ -141,13 +143,12 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         num_input_tokens = common_attn_metadata.num_input_tokens
         positions = common_attn_metadata.positions[:num_input_tokens].long()
         slot_mapping = self._slot_mapping_buffer[:num_input_tokens]
-        slot_mapping.copy_(
-            format_indexer_kpool_slot_mapping(
-                common_attn_metadata.slot_mapping[:num_input_tokens],
-                positions,
-                self.logical_block_size,
-                self.compress_ratio,
-            )
+        format_indexer_kpool_slot_mapping(
+            common_attn_metadata.slot_mapping[:num_input_tokens],
+            positions,
+            self.logical_block_size,
+            self.compress_ratio,
+            out=slot_mapping,
         )
         seq_lens = self._seq_lens_buffer[:num_reqs]
         torch.div(
@@ -376,6 +377,8 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
 
     @property
     def topk_output_width(self) -> int:
+        if indexer_pool_id_enabled(self.index_kpool):
+            return self.topk_tokens // self.index_kpool + 1
         return self.topk_tokens + self.index_kpool - 1
 
     def get_topk_lengths(self, positions: torch.Tensor) -> torch.Tensor:

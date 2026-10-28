@@ -19,6 +19,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
     AscendMLAAttentionSpec,
 )
+from vllm_ascend import envs
 from vllm_ascend.utils import vllm_version_is
 
 
@@ -26,16 +27,54 @@ def is_glm5_next_cache_spec(spec: KVCacheSpec) -> bool:
     return getattr(spec, "model_version", None) == "glm5_next"
 
 
+def get_kpool_tail_ring_capacity(vllm_config: VllmConfig, compress_ratio: int) -> int:
+    """Keep the open pool plus every not-yet-accepted speculative token.
+
+    Target verification writes all draft rows before rejection sampling is
+    known.  The first row is the already-sampled token and is committed; the
+    remaining ``num_speculative_tokens`` rows are lookahead.  Retaining that
+    lookahead in addition to one full pool prevents rejected rows from wrapping
+    around and destroying committed history that a replayed boundary token
+    still needs.
+    """
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    lookahead = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
+    if lookahead < 0:
+        raise ValueError(f"num_speculative_tokens must be nonnegative, got {lookahead}.")
+    return compress_ratio + lookahead
+
+
 def format_indexer_kpool_slot_mapping(
     slot_mapping: torch.Tensor,
     positions: torch.Tensor,
     logical_block_size: int,
     compress_ratio: int,
+    *,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Map completed token pools onto the compressed indexer cache."""
     if compress_ratio <= 1 or logical_block_size <= 0 or logical_block_size % compress_ratio:
         raise ValueError(
             f"logical_block_size={logical_block_size} must be divisible by compress_ratio={compress_ratio}."
+        )
+    use_triton = (
+        envs.VLLM_ASCEND_ENABLE_KPOOL_SLOT_TRITON
+        and slot_mapping.device.type == "npu"
+        and positions.device.type == "npu"
+        and slot_mapping.dtype in (torch.int32, torch.int64)
+        and positions.dtype in (torch.int32, torch.int64)
+    )
+    if use_triton:
+        from vllm_ascend.ops.triton.kpool.slot_mapping import (
+            kpool_slot_mapping_triton,
+        )
+
+        return kpool_slot_mapping_triton(
+            slot_mapping,
+            positions,
+            logical_block_size,
+            compress_ratio,
+            out=out,
         )
     valid = (slot_mapping >= 0) & (torch.remainder(positions + 1, compress_ratio) == 0)
     safe_slots = slot_mapping.clamp_min(0)
@@ -46,7 +85,11 @@ def format_indexer_kpool_slot_mapping(
         compress_ratio,
         rounding_mode="floor",
     )
-    return torch.where(valid, compressed_slots, torch.full_like(compressed_slots, -1))
+    result = torch.where(valid, compressed_slots, torch.full_like(compressed_slots, -1))
+    if out is not None:
+        out[: result.shape[0]].copy_(result)
+        return out[: result.shape[0]]
+    return result
 
 
 class Glm5NextIndexerCache(nn.Module, AttentionLayerBase):

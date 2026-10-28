@@ -7,6 +7,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+
+from vllm_ascend import envs
+from vllm_ascend.models.glm5next.indexer_contract import indexer_pool_id_enabled
 from torch import nn
 
 from vllm_ascend.ops.triton.glm5_next_kpool_tail_compress import (  # type: ignore[import-untyped]
@@ -87,7 +90,7 @@ class SparseAttnIndexerKpool(nn.Module):
             return (
                 None
                 if not compute_topk
-                else torch.empty((0, 1, self.topk_tokens + index_kpool - 1), dtype=torch.int32, device=k.device)
+                else torch.empty((0, 1, self.topk_tokens // index_kpool + 1 if indexer_pool_id_enabled(index_kpool) else self.topk_tokens + index_kpool - 1), dtype=torch.int32, device=k.device)
             )
         if indexer_metadata.cum_query_lens is None or indexer_metadata.raw_seq_lens is None:
             raise ValueError("GLM KPool metadata requires cum_query_lens and raw_seq_lens.")
@@ -139,9 +142,12 @@ class SparseAttnIndexerKpool(nn.Module):
             index_kpool=index_kpool,
             max_pool_seq_len=max_pool_seq_len,
         )
-        # A2/A3 SFA requires a contiguous valid prefix; the reference indexer
-        # puts the running tail at the fixed top-k column for short requests.
-        append_causal_tail(indices[:, 0], positions, self.topk_tokens, index_kpool)
-        valid = torch.arange(num_tokens, device=k.device) < indexer_metadata.cum_query_lens[-1]
-        indices.masked_fill_(~valid[:, None, None], -1)
+        # Pool-id mode emits compressed pool ids plus one tail pool id; the
+        # attention backend expands them with sparse_block_size=4.
+        epilogue = envs.VLLM_ASCEND_ENABLE_TRITON_INDEXER_EPILOGUE and index_kpool == 4
+        if not epilogue:
+            if not indexer_pool_id_enabled(index_kpool):
+                append_causal_tail(indices[:, 0], positions, self.topk_tokens, index_kpool)
+            valid = torch.arange(num_tokens, device=k.device) < indexer_metadata.cum_query_lens[-1]
+            indices.masked_fill_(~valid[:, None, None], -1)
         return indices

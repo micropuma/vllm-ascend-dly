@@ -20,6 +20,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.utils import select_common_block_size
 
+from vllm_ascend.models.glm5next.indexer_contract import sparse_index_block_size
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -144,7 +145,7 @@ def sparse_mla(query, cache, indices, metadata, scale):
             value=cache,
             sparse_indices=indices,
             scale_value=scale,
-            sparse_block_size=1,
+            sparse_block_size=sparse_index_block_size(indices, metadata.block_size),
             block_table=metadata.block_table,
             actual_seq_lengths_query=metadata.query_start_loc[1:].to(torch.int32),
             actual_seq_lengths_kv=metadata.seq_lens.to(torch.int32),

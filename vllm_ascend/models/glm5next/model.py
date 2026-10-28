@@ -5,6 +5,8 @@ from collections.abc import Iterable
 from typing import Any, ClassVar, Literal
 
 import torch
+
+from vllm_ascend.models.glm5next.indexer_contract import indexer_pool_id_enabled
 import torch_npu
 from torch import nn
 from vllm.config import ParallelConfig, VllmConfig
@@ -563,7 +565,7 @@ class Glm5NextModel(nn.Module):
             # Reserve room for the incomplete pool tail.
             kpool = config.index_kpool
             assert kpool is not None
-            buffer_width = topk_tokens + (kpool - 1 if kpool > 1 else 0)
+            buffer_width = (topk_tokens // kpool + 1 if indexer_pool_id_enabled(kpool) else topk_tokens + (kpool - 1 if kpool > 1 else 0))
             # Sparse MLA tiles top-k in 128 columns; padded slots remain masked.
             sparse_topk_block_n = 128
             buffer_width = ((buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n) * sparse_topk_block_n
